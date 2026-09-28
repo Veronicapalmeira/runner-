@@ -23,14 +23,34 @@ jobs:
       - name: Baixar código
         uses: actions/checkout@v6
 
+      - name: Configurar Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: projetos/assinatura-go/go.mod
+
+      - name: Configurar Java 21
+        uses: actions/setup-java@v6
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+
       - name: Inicializar CodeQL
         uses: github/codeql-action/init@v4
         with:
           languages: go,java
+          build-mode: manual
 
-      - name: Compilar para análise do CodeQL
-        uses: github/codeql-action/autobuild@v4
+      - name: Compilar código para análise do CodeQL
+        run: |
+          cd projetos/assinatura-go
+          go build -o assinatura .
 
+          cd ../simulador-go
+          go build -o simulador .
+
+          cd ../assinador-java
+          ./mvnw -B package -DskipTests
 
       - name: Analisar código com CodeQL
         uses: github/codeql-action/analyze@v4
