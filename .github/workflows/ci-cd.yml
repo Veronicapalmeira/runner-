@@ -28,6 +28,10 @@ jobs:
         with:
           languages: go,java
 
+      - name: Compilar para análise do CodeQL
+        uses: github/codeql-action/autobuild@v4
+
+
       - name: Analisar código com CodeQL
         uses: github/codeql-action/analyze@v4
 
