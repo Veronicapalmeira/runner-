@@ -128,7 +128,7 @@ jobs:
           distribution: temurin
 
       - name: Iniciar aplicação
-        working-directory: application/projetos/assinador-java/target
+        working-directory: application/assinador-java/target
         run: |
           java -jar assinador.jar --modo=servidor --porta=8080 > server.log 2>&1 &
           sleep 10
