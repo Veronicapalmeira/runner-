@@ -143,8 +143,11 @@ jobs:
     needs: staging
 
     steps:
-      - name: Baixar código
-        uses: actions/checkout@v6
+      - name: Baixar artefatos
+        uses: actions/download-artifact@v5
+        with:
+          name: runner-application
+          path: application
 
       - name: Configurar Java 21
         uses: actions/setup-java@v6
@@ -152,14 +155,10 @@ jobs:
           java-version: '21'
           distribution: temurin
 
-      - name: Empacotar aplicação
-        working-directory: projetos/assinador-java
-        run: ./mvnw -B package -DskipTests
-
       - name: Iniciar aplicação
-        working-directory: projetos/assinador-java
+        working-directory: application/assinador-java/target
         run: |
-          java -jar target/assinador.jar --modo=servidor --porta=8080 > server.log 2>&1 &
+          java -jar assinador.jar --modo=servidor --porta=8080 > server.log 2>&1 &
           sleep 10
 
       - name: Verificar endpoint da aplicação
