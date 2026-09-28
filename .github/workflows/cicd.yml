@@ -1,0 +1,352 @@
+```yaml
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+
+  push:
+    branches: [main]
+    tags:
+      - 'v*.*.*'
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # =========================
+  # CI - verificacao estatica
+  # =========================
+
+  lint-go:
+    name: Analise estatica Go
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [assinatura-go, simulador-go]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: projetos/${{ matrix.module }}/go.mod
+          cache-dependency-path: projetos/${{ matrix.module }}/go.sum
+
+      - name: Executar golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.5.0
+          working-directory: projetos/${{ matrix.module }}
+
+  codeql:
+    name: Analise de seguranca CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            build-mode: manual
+          - language: java
+            build-mode: none
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Configurar Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: projetos/assinatura-go/go.mod
+          cache-dependency-path: projetos/assinatura-go/go.sum
+
+      - name: Compilar modulos Go para analise
+        if: matrix.language == 'go'
+        shell: bash
+        run: |
+          cd projetos/assinatura-go
+          go build ./...
+
+          cd ../simulador-go
+          go build ./...
+
+      - name: Analisar com CodeQL
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}
+
+  # =========================
+  # CI - verificacao dinamica
+  # =========================
+
+  test-go:
+    name: Testes Go (${{ matrix.module }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [assinatura-go, simulador-go]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: projetos/${{ matrix.module }}/go.mod
+          cache-dependency-path: projetos/${{ matrix.module }}/go.sum
+
+      - name: Executar testes com cobertura
+        working-directory: projetos/${{ matrix.module }}
+        run: go test -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Publicar cobertura
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.module }}
+          path: projetos/${{ matrix.module }}/coverage.out
+          retention-days: 7
+
+  test-java:
+    name: Testes Java 21
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+
+      - name: Executar testes JUnit e gerar cobertura JaCoCo
+        working-directory: projetos/assinador-java
+        run: ./mvnw -B test
+
+      - name: Publicar relatorio JaCoCo
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report
+          path: projetos/assinador-java/target/site/jacoco
+          retention-days: 7
+
+  # =========================
+  # CD - empacotamento
+  # =========================
+
+  build:
+    name: Empacotar aplicacao
+
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    needs: [lint-go, codeql, test-go, test-java]
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: projetos/assinatura-go/go.mod
+          cache-dependency-path: projetos/assinatura-go/go.sum
+
+      - name: Configurar Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+
+      - name: Validar versao da tag
+        id: version
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DECLARADA="$(jq -r .version release.json)"
+
+          if [ "$VERSION" != "$DECLARADA" ]; then
+            echo "A tag v$VERSION nao coincide com release.json (version=$DECLARADA)." >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Criar diretorio de distribuicao
+        run: mkdir -p dist
+
+      - name: Compilar CLI assinatura
+        working-directory: projetos/assinatura-go
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          DATE="$(date -u +%Y-%m-%d)"
+
+          LDFLAGS="-X github.com/jusouzn/assinatura/cmd.Version=${VERSION} -X github.com/jusouzn/assinatura/cmd.Commit=${COMMIT} -X github.com/jusouzn/assinatura/cmd.Date=${DATE}"
+
+          GOOS=linux GOARCH=amd64 go build \
+            -ldflags="${LDFLAGS}" \
+            -o "../../dist/assinatura-${VERSION}-linux-amd64" .
+
+          GOOS=windows GOARCH=amd64 go build \
+            -ldflags="${LDFLAGS}" \
+            -o "../../dist/assinatura-${VERSION}-windows-amd64.exe" .
+
+          GOOS=darwin GOARCH=amd64 go build \
+            -ldflags="${LDFLAGS}" \
+            -o "../../dist/assinatura-${VERSION}-macos-amd64" .
+
+      - name: Compilar CLI simulador
+        working-directory: projetos/simulador-go
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          DATE="$(date -u +%Y-%m-%d)"
+
+          LDFLAGS="-X github.com/jusouzn/simulador/cmd.Version=${VERSION} -X github.com/jusouzn/simulador/cmd.Commit=${COMMIT} -X github.com/jusouzn/simulador/cmd.Date=${DATE}"
+
+          GOOS=linux GOARCH=amd64 go build \
+            -ldflags="${LDFLAGS}" \
+            -o "../../dist/simulador-${VERSION}-linux-amd64" .
+
+          GOOS=windows GOARCH=amd64 go build \
+            -ldflags="${LDFLAGS}" \
+            -o "../../dist/simulador-${VERSION}-windows-amd64.exe" .
+
+          GOOS=darwin GOARCH=amd64 go build \
+            -ldflags="${LDFLAGS}" \
+            -o "../../dist/simulador-${VERSION}-macos-amd64" .
+
+      - name: Compilar assinador.jar
+        working-directory: projetos/assinador-java
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          ./mvnw -B package -DskipTests
+
+          cp target/assinador.jar "../../dist/assinador-${VERSION}.jar"
+
+      - name: Gerar checksum
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - name: Publicar artefatos de build
+        uses: actions/upload-artifact@v4
+        with:
+          name: aplicacao-${{ steps.version.outputs.version }}
+          path: dist/
+          retention-days: 30
+
+  # =========================
+  # CD - homologacao
+  # =========================
+
+  deploy-homologacao:
+    name: Deploy em homologacao
+
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    needs: build
+
+    runs-on: ubuntu-latest
+
+    environment:
+      name: homologacao
+
+    steps:
+      - name: Baixar artefatos
+        uses: actions/download-artifact@v4
+        with:
+          name: aplicacao-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Validacao dinamica de homologacao
+        shell: bash
+        run: |
+          JAR="$(find dist -name 'assinador-*.jar' -type f | head -1)"
+          BIN="$(find dist -name 'assinatura-*-linux-amd64' -type f | head -1)"
+
+          chmod +x "$BIN"
+
+          java -jar "$JAR" \
+            --modo=local \
+            --operacao=assinar \
+            --pin=1234 \
+            --conteudo="teste-ci-cd" \
+            > /tmp/assinatura.json
+
+          grep -q '"status": "success"' /tmp/assinatura.json
+
+          "$BIN" version
+
+          echo "Homologacao validada com sucesso."
+
+  # =========================
+  # CD - producao
+  # =========================
+
+  deploy-producao:
+    name: Deploy em producao
+
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    needs: [build, deploy-homologacao]
+
+    runs-on: ubuntu-latest
+
+    environment:
+      name: producao
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Baixar artefatos
+        uses: actions/download-artifact@v4
+        with:
+          name: aplicacao-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Publicar GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          gh release create "$VERSION" dist/* \
+            --title "$VERSION" \
+            --generate-notes
+```
